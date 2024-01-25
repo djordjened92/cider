@@ -4,10 +4,13 @@ Aapted from SupCon: https://github.com/HobbitLong/SupContrast/
 """
 from __future__ import print_function
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+from collections import defaultdict
+from sklearn.cluster import KMeans
 
 def binarize(T, nb_classes):
     T = T.cpu().numpy()
@@ -161,15 +164,17 @@ class CompLoss(nn.Module):
         self.base_temperature = base_temperature
 
     def forward(self, features, prototypes, labels):
-        prototypes = F.normalize(prototypes, dim=1) 
+        prototypes = F.normalize(prototypes, dim=-1)
         proxy_labels = torch.arange(0, self.args.n_cls).cuda()
         labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, proxy_labels.T).float().cuda() #bz, cls
 
         # compute logits
-        feat_dot_prototype = torch.div(
-            torch.matmul(features, prototypes.T),
-            self.temperature)
+        feat_dot_prototype = torch.matmul(features, prototypes.view(-1, self.args.feat_dim).T)
+        feat_dot_prototype = feat_dot_prototype.view(features.shape[0], prototypes.shape[0], -1)
+        feat_dot_prototype, _ = feat_dot_prototype.max(-1)
+        feat_dot_prototype = torch.div(feat_dot_prototype, self.temperature)
+
         # for numerical stability
         logits_max, _ = torch.max(feat_dot_prototype, dim=1, keepdim=True)
         logits = feat_dot_prototype - logits_max.detach()
@@ -245,33 +250,63 @@ class DisLoss(nn.Module):
     '''
     Dispersion Loss with EMA prototypes
     '''
-    def __init__(self, args, model, loader, temperature= 0.1, base_temperature=0.1):
+    def __init__(self, args, model, loader, temperature= 0.1, base_temperature=0.1, num_of_proto=3):
         super(DisLoss, self).__init__()
         self.args = args
+        self.num_of_proto = num_of_proto
         self.temperature = temperature
         self.base_temperature = base_temperature
-        self.register_buffer("prototypes", torch.zeros(self.args.n_cls,self.args.feat_dim))
+        self.register_buffer("prototypes", torch.zeros(self.args.n_cls, self.num_of_proto, self.args.feat_dim))
         self.model = model
         self.loader = loader
         self.init_class_prototypes()
 
-    def forward(self, features, labels):    
+    def init_class_prototypes(self):
+        """Initialize class prototypes"""
+        self.model.eval()
+        start = time.time()
+        train_embeds = defaultdict(list)
+        with torch.no_grad():
+            for i, (input, target) in enumerate(self.loader):
+                input, target = input.cuda(), target.cuda()
+                features = self.model(input)
+                for j, feature in enumerate(features):
+                    train_embeds[target[j].item()].append(feature.cpu().numpy())
 
+            # measure elapsed time
+            self.prototypes = torch.from_numpy(self.kmeans(train_embeds)).float().cuda()
+            duration = time.time() - start
+            print(f'Time to initialize prototypes: {duration:.3f}')
+
+    def kmeans(self, embeddings):
+        prototypes = []
+
+        # Cluster each class
+        for class_embs in embeddings.values():
+            kmeans = KMeans(n_clusters=self.num_of_proto, init='k-means++', random_state=0, n_init="auto").fit(class_embs)
+            prototypes.append(kmeans.cluster_centers_)
+
+        return np.array(prototypes)
+
+    def forward(self, features, labels):
         prototypes = self.prototypes
         num_cls = self.args.n_cls
         for j in range(len(features)):
-            prototypes[labels[j].item()] = F.normalize(prototypes[labels[j].item()] *self.args.proto_m + features[j]*(1-self.args.proto_m), dim=0)
+            curr_pt = prototypes[labels[j].item()]
+            curr_idx = (curr_pt @ features[j]).argmin()
+            prototypes[labels[j].item()][curr_idx] = F.normalize(prototypes[labels[j].item()][curr_idx] * self.args.proto_m + features[j]*(1-self.args.proto_m), dim=0)
         self.prototypes = prototypes.detach()
+
         labels = torch.arange(0, num_cls).cuda()
-        labels = labels.contiguous().view(-1, 1)
+        labels = labels.view(-1, 1).repeat(1, self.num_of_proto).view(-1, 1).contiguous()
 
-        mask = (1- torch.eq(labels, labels.T).float()).cuda()
+        logits = torch.div(torch.matmul(prototypes.view(-1, self.args.feat_dim), prototypes.view(-1, self.args.feat_dim).T),
+                           self.temperature)
+        
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
 
-
-        logits = torch.div(
-            torch.matmul(prototypes, prototypes.T),
-            self.temperature)
-
+        mask = torch.eq(labels, labels.T).float().cuda()
         logits_mask = torch.scatter(
             torch.ones_like(mask),
             1,
@@ -279,28 +314,14 @@ class DisLoss(nn.Module):
             0
         )
         mask = mask * logits_mask
-        mean_prob_neg = torch.log((mask * torch.exp(logits)).sum(1) / mask.sum(1))
-        mean_prob_neg = mean_prob_neg[~torch.isnan(mean_prob_neg)]
-        loss = self.temperature / self.base_temperature * mean_prob_neg.mean()
-        return loss
 
-    def init_class_prototypes(self):
-        """Initialize class prototypes"""
-        self.model.eval()
-        start = time.time()
-        prototype_counts = [0]*self.args.n_cls
-        with torch.no_grad():
-            prototypes = torch.zeros(self.args.n_cls,self.args.feat_dim).cuda()
-            for i, (input, target) in enumerate(self.loader):
-                input, target = input.cuda(), target.cuda()
-                features = self.model(input)
-                for j, feature in enumerate(features):
-                    prototypes[target[j].item()] += feature
-                    prototype_counts[target[j].item()] += 1
-            for cls in range(self.args.n_cls):
-                prototypes[cls] /=  prototype_counts[cls] 
-            # measure elapsed time
-            duration = time.time() - start
-            print(f'Time to initialize prototypes: {duration:.3f}')
-            prototypes = F.normalize(prototypes, dim=1)
-            self.prototypes = prototypes
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos.mean()
+        return loss
